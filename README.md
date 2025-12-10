@@ -1,9 +1,9 @@
-# Multi-Store POS + Inventory (Node.js, Express, React, SQLite)
+# Multi-Store POS + Inventory (Node.js, Express, React, MongoDB Atlas)
 
 This is a functional POS + Inventory system with:
 
 - Node.js + Express backend
-- SQLite database
+- MongoDB Atlas database (via Mongoose)
 - React + Vite frontend
 - **Multi-store** support (stores, registers)
 - POS checkout with tax calculation
@@ -23,35 +23,45 @@ This is a functional POS + Inventory system with:
 
 ## Structure
 
-- `server/` – Express API + SQLite
+- `server/` – Express API + MongoDB (Mongoose)
 - `client/` – React POS frontend (Vite)
 
 ---
 
 ## Getting started
 
-### Backend
+### Backend (MongoDB Atlas)
 
-```bash
-cd server
-npm install
-npm run dev
-# API will run on http://localhost:4000
-```
+1. **Create a MongoDB Atlas cluster** (or use an existing one) and a database user.
+2. Get your connection string, e.g.:
 
-On first run it will:
+   ```text
+   mongodb+srv://Admin:<db_password>@cluster0.vyabsir.mongodb.net/pos?retryWrites=true&w=majority&appName=Cluster0
+   ```
 
-- Create `server/data/pos.sqlite`
-- Create schema
-- Seed:
-  - Store `001 - Demo Superstore`
-  - Register `R1 - Front Register 1`
-  - Sample products
-  - A default receipt template
-  - Demo users:
-    - `admin` / `admin123` (role: `admin`)
-    - `manager` / `manager123` (role: `manager`)
-    - `cashier` / `cashier123` (role: `cashier`)
+3. Export the connection URI (and optionally a JWT secret) in your shell:
+
+   ```bash
+   cd server
+   npm install
+
+   export MONGODB_URI="mongodb+srv://Admin:<db_password>@cluster0.vyabsir.mongodb.net/pos?retryWrites=true&w=majority&appName=Cluster0"
+   export JWT_SECRET="some-long-random-string"
+
+   npm run dev
+   # API will run on http://localhost:4000
+   ```
+
+On first run it will connect to MongoDB and seed:
+
+- Store `001 - Demo Superstore`
+- Register `R1 - Front Register 1`
+- Sample products (Milk, Bread, Batteries) with quantity 100 at that store
+- A default receipt template for that store
+- Demo users:
+  - `admin` / `admin123` (role: `admin`)
+  - `manager` / `manager123` (role: `manager`)
+  - `cashier` / `cashier123` (role: `cashier`)
 
 ### Frontend
 
@@ -160,7 +170,7 @@ Backend endpoints:
     ```json
     {
       "items": [
-        { "transactionItemId": 123, "quantity": 1 }
+        { "transactionItemId": "<transactionItemId>", "quantity": 1 }
       ]
     }
     ```
@@ -170,6 +180,8 @@ Backend endpoints:
   - **Increases** inventory (puts stock back)
   - Generates a new TC# for the refund
   - Returns `{ transaction, items, receiptText }`
+
+> Note: In the MongoDB version, IDs are string ObjectIds instead of integers. The API always returns IDs as strings (e.g. `"id": "65f..."`), and the frontend sends those back unchanged.
 
 Front-end Return flow:
 
