@@ -39,18 +39,24 @@ This is a functional POS + Inventory system with:
    mongodb+srv://Admin:<db_password>@cluster0.vyabsir.mongodb.net/pos?retryWrites=true&w=majority&appName=Cluster0
    ```
 
-3. Export the connection URI (and optionally a JWT secret) in your shell:
+3. For local development, create a `.env` file in `server/` based on `.env.example`:
 
    ```bash
    cd server
    npm install
 
-   export MONGODB_URI="mongodb+srv://Admin:<db_password>@cluster0.vyabsir.mongodb.net/pos?retryWrites=true&w=majority&appName=Cluster0"
-   export JWT_SECRET="some-long-random-string"
+   cp .env.example .env
+   # then edit .env to put in your real MongoDB password and secrets
 
    npm run dev
    # API will run on http://localhost:4000
    ```
+
+Environment variables used by the backend:
+
+- `MONGODB_URI` – connection string to MongoDB Atlas.
+- `JWT_SECRET` – secret key for signing JWT tokens.
+- `PRINT_AGENT_BASE` – (optional) base URL of the print agent for auto-printing.
 
 On first run it will connect to MongoDB and seed:
 
@@ -65,13 +71,32 @@ On first run it will connect to MongoDB and seed:
 
 ### Frontend
 
+The frontend is a Vite + React app, and it reads its API base URL from
+`VITE_API_BASE_URL`.
+
+For local development:
+
 ```bash
 cd client
 npm install
+
+# Optional: create a .env file based on .env.example
+# cp .env.example .env
+
 npm run dev
 # Vite dev server on http://localhost:5173
-# It proxies /api to http://localhost:4000
+# With the default .env.example, it talks to http://localhost:4000/api
 ```
+
+For deployment on Vercel:
+
+- Create a new Vercel project pointing at the `client/` directory.
+- In the **Environment Variables** section for that project, set:
+
+  - `VITE_API_BASE_URL` → e.g. `https://your-backend.example.com/api`
+
+- Vercel will build with `npm run build` and serve the static `dist/` output.
+- The app will call your backend using `VITE_API_BASE_URL`.
 
 Open `http://localhost:5173`:
 

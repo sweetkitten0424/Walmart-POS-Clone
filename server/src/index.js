@@ -1,6 +1,14 @@
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
+
+// Load environment variables from .env in local development.
+// In Vercel or other hosts, set these in the platform UI.
+if (process.env.NODE_ENV !== 'production') {
+  // eslint-disable-next-line global-require
+  require('dotenv').config();
+}
+
 const {
   initDb,
   Store,

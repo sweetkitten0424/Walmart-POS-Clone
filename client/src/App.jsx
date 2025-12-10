@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import Barcode from 'react-barcode';
 
-const API_BASE = '/api';
+const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
 
 function App() {
   const [auth, setAuth] = useState(null); // { token, user }
