@@ -1,7 +1,17 @@
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
-const { db, initDb } = require('./db');
+const {
+  initDb,
+  Store,
+  Register,
+  Product,
+  Inventory,
+  ReceiptTemplate,
+  User,
+  Transaction,
+  TransactionItem
+} = require('./db');
 const { generateTC } = require('./tcGenerator');
 const { renderTextReceipt } = require('./receiptRenderer');
 const { handleLogin, authMiddleware, requireRole } = require('./auth');
@@ -10,21 +20,14 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const PRINT_AGENT_BASE = process.env.PRINT_AGENT_BASE || null;
 
-initDb();
-
 app.use(cors());
 app.use(express.json());
-
-function getStoreById(storeId) {
-  return db.prepare('SELECT * FROM stores WHERE id = ?').get(storeId);
-}
 
 function sendToPrintAgent(transactionId) {
   if (!PRINT_AGENT_BASE || !transactionId) {
     return;
   }
 
-  // Fire-and-forget: do not await, avoid delaying API responses
   (async () => {
     try {
       await fetch(`${PRINT_AGENT_BASE}/print/transaction`, {
@@ -39,14 +42,6 @@ function sendToPrintAgent(transactionId) {
   })();
 }
 
-function getRegisterById(registerId) {
-  return db.prepare('SELECT * FROM registers WHERE id = ?').get(registerId);
-}
-
-function getProductById(productId) {
-  return db.prepare('SELECT * FROM products WHERE id = ? AND active = 1').get(productId);
-}
-
 // Public endpoints
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
@@ -58,28 +53,25 @@ app.post('/api/auth/login', handleLogin);
 app.use(authMiddleware);
 
 // User management (admin only)
-app.get('/api/users', requireRole('admin'), (req, res) => {
-  const rows = db
-    .prepare(
-      `
-      SELECT
-        u.id,
-        u.username,
-        u.role,
-        u.store_id,
-        s.code AS store_code,
-        s.name AS store_name
-      FROM users u
-      LEFT JOIN stores s ON s.id = u.store_id
-      ORDER BY u.username
-    `
-    )
-    .all();
+app.get('/api/users', requireRole('admin'), async (req, res) => {
+  const users = await User.find({})
+    .populate('store')
+    .sort({ username: 1 })
+    .lean();
 
-  res.json(rows);
+  const result = users.map((u) => ({
+    id: String(u._id),
+    username: u.username,
+    role: u.role,
+    store_id: u.store ? String(u.store._id) : null,
+    store_code: u.store ? u.store.code : null,
+    store_name: u.store ? u.store.name : null
+  }));
+
+  res.json(result);
 });
 
-app.post('/api/users', requireRole('admin'), (req, res) => {
+app.post('/api/users', requireRole('admin'), async (req, res) => {
   const { username, password, role, storeId } = req.body || {};
 
   if (!username || !password || !role) {
@@ -93,100 +85,70 @@ app.post('/api/users', requireRole('admin'), (req, res) => {
     return res.status(400).json({ error: 'Invalid role' });
   }
 
-  let storeIdValue = null;
-  if (storeId !== undefined && storeId !== null && storeId !== '') {
-    const numericStoreId = Number(storeId);
-    if (!numericStoreId) {
-      return res.status(400).json({ error: 'Invalid storeId' });
-    }
-    const store = getStoreById(numericStoreId);
+  let store = null;
+  if (storeId) {
+    store = await Store.findById(storeId).lean();
     if (!store) {
       return res.status(400).json({ error: 'Invalid storeId' });
     }
-    storeIdValue = numericStoreId;
   }
 
   const passwordHash = bcrypt.hashSync(password, 10);
 
   try {
-    const info = db
-      .prepare(
-        'INSERT INTO users (username, password_hash, role, store_id) VALUES (?, ?, ?, ?)'
-      )
-      .run(username.trim(), passwordHash, role, storeIdValue);
+    const created = await User.create({
+      username: username.trim(),
+      password_hash: passwordHash,
+      role,
+      store: store ? store._id : null
+    });
 
-    const created = db
-      .prepare(
-        `
-        SELECT
-          u.id,
-          u.username,
-          u.role,
-          u.store_id,
-          s.code AS store_code,
-          s.name AS store_name
-        FROM users u
-        LEFT JOIN stores s ON s.id = u.store_id
-        WHERE u.id = ?
-      `
-      )
-      .get(info.lastInsertRowid);
-
-    res.status(201).json(created);
+    return res.status(201).json({
+      id: String(created._id),
+      username: created.username,
+      role: created.role,
+      store_id: created.store ? String(created.store) : null,
+      store_code: store ? store.code : null,
+      store_name: store ? store.name : null
+    });
   } catch (err) {
-    if (String(err.message || '').includes('UNIQUE constraint failed: users.username')) {
+    if (String(err.message || '').includes('duplicate key error')) {
       return res.status(400).json({ error: 'Username already exists' });
     }
     return res.status(500).json({ error: 'Failed to create user' });
   }
 });
 
-app.put('/api/users/:id', requireRole('admin'), (req, res) => {
-  const id = Number(req.params.id);
-  if (!id) {
-    return res.status(400).json({ error: 'Invalid user id' });
-  }
+app.put('/api/users/:id', requireRole('admin'), async (req, res) => {
+  const id = req.params.id;
 
-  const existing = db
-    .prepare('SELECT * FROM users WHERE id = ?')
-    .get(id);
-
+  const existing = await User.findById(id);
   if (!existing) {
     return res.status(404).json({ error: 'User not found' });
   }
 
   const { username, password, role, storeId } = req.body || {};
-
   const allowedRoles = ['admin', 'manager', 'cashier'];
   const newRole = role != null ? role : existing.role;
   if (!allowedRoles.includes(newRole)) {
     return res.status(400).json({ error: 'Invalid role' });
   }
 
-  let storeIdValue =
-    existing.store_id !== null && existing.store_id !== undefined
-      ? existing.store_id
-      : null;
+  let store = existing.store;
   if (storeId !== undefined) {
-    if (storeId === null || storeId === '') {
-      storeIdValue = null;
+    if (!storeId) {
+      store = null;
     } else {
-      const numericStoreId = Number(storeId);
-      if (!numericStoreId) {
+      const storeDoc = await Store.findById(storeId).lean();
+      if (!storeDoc) {
         return res.status(400).json({ error: 'Invalid storeId' });
       }
-      const store = getStoreById(numericStoreId);
-      if (!store) {
-        return res.status(400).json({ error: 'Invalid storeId' });
-      }
-      storeIdValue = numericStoreId;
+      store = storeDoc._id;
     }
   }
 
   const newUsername =
-    username != null && username.trim()
-      ? username.trim()
-      : existing.username;
+    username != null && username.trim() ? username.trim() : existing.username;
 
   let passwordHash = existing.password_hash;
   if (password != null && password !== '') {
@@ -194,45 +156,34 @@ app.put('/api/users/:id', requireRole('admin'), (req, res) => {
   }
 
   try {
-    db.prepare(
-      `
-      UPDATE users
-      SET username = ?, password_hash = ?, role = ?, store_id = ?
-      WHERE id = ?
-    `
-    ).run(newUsername, passwordHash, newRole, storeIdValue, id);
+    existing.username = newUsername;
+    existing.password_hash = passwordHash;
+    existing.role = newRole;
+    existing.store = store;
+    await existing.save();
 
-    const updated = db
-      .prepare(
-        `
-        SELECT
-          u.id,
-          u.username,
-          u.role,
-          u.store_id,
-          s.code AS store_code,
-          s.name AS store_name
-        FROM users u
-        LEFT JOIN stores s ON s.id = u.store_id
-        WHERE u.id = ?
-      `
-      )
-      .get(id);
+    const populated = await User.findById(existing._id)
+      .populate('store')
+      .lean();
 
-    res.json(updated);
+    return res.json({
+      id: String(populated._id),
+      username: populated.username,
+      role: populated.role,
+      store_id: populated.store ? String(populated.store._id) : null,
+      store_code: populated.store ? populated.store.code : null,
+      store_name: populated.store ? populated.store.name : null
+    });
   } catch (err) {
-    if (String(err.message || '').includes('UNIQUE constraint failed: users.username')) {
+    if (String(err.message || '').includes('duplicate key error')) {
       return res.status(400).json({ error: 'Username already exists' });
     }
     return res.status(500).json({ error: 'Failed to update user' });
   }
 });
 
-app.delete('/api/users/:id', requireRole('admin'), (req, res) => {
-  const id = Number(req.params.id);
-  if (!id) {
-    return res.status(400).json({ error: 'Invalid user id' });
-  }
+app.delete('/api/users/:id', requireRole('admin'), async (req, res) => {
+  const id = req.params.id;
 
   if (id === req.user.id) {
     return res
@@ -240,71 +191,94 @@ app.delete('/api/users/:id', requireRole('admin'), (req, res) => {
       .json({ error: 'You cannot delete your own user account' });
   }
 
-  const existing = db
-    .prepare('SELECT * FROM users WHERE id = ?')
-    .get(id);
-
+  const existing = await User.findById(id);
   if (!existing) {
     return res.status(404).json({ error: 'User not found' });
   }
 
-  db.prepare('DELETE FROM users WHERE id = ?').run(id);
-  res.status(204).end();
+  await User.deleteOne({ _id: existing._id }).exec();
+  return res.status(204).end();
 });
 
 // Stores
-app.get('/api/stores', (req, res) => {
-  const stores = db.prepare('SELECT * FROM stores ORDER BY code').all();
-  res.json(stores);
+app.get('/api/stores', async (req, res) => {
+  const stores = await Store.find().sort({ code: 1 }).lean();
+  const result = stores.map((s) => ({
+    id: String(s._id),
+    code: s.code,
+    name: s.name,
+    address: s.address,
+    phone: s.phone
+  }));
+  res.json(result);
 });
 
 // Registers for a store
-app.get('/api/registers', (req, res) => {
-  const storeId = Number(req.query.storeId);
+app.get('/api/registers', async (req, res) => {
+  const storeId = req.query.storeId;
   if (!storeId) {
     return res.status(400).json({ error: 'storeId is required' });
   }
-  const registers = db
-    .prepare('SELECT * FROM registers WHERE store_id = ? ORDER BY code')
-    .all(storeId);
-  res.json(registers);
+
+  const registers = await Register.find({ store: storeId })
+    .sort({ code: 1 })
+    .lean();
+  const result = registers.map((r) => ({
+    id: String(r._id),
+    store_id: String(r.store),
+    code: r.code,
+    name: r.name
+  }));
+  res.json(result);
 });
 
 // Products listing/search
-app.get('/api/products', (req, res) => {
+app.get('/api/products', async (req, res) => {
   const search = (req.query.search || '').trim();
-  let products;
+  const filter = { active: true };
   if (search) {
-    const like = `%${search}%`;
-    products = db
-      .prepare(
-        'SELECT * FROM products WHERE (name LIKE ? OR sku LIKE ?) AND active = 1 ORDER BY name'
-      )
-      .all(like, like);
-  } else {
-    products = db
-      .prepare('SELECT * FROM products WHERE active = 1 ORDER BY name')
-      .all();
+    filter.$or = [
+      { name: { $regex: search, $options: 'i' } },
+      { sku: { $regex: search, $options: 'i' } }
+    ];
   }
-  res.json(products);
+  const products = await Product.find(filter).sort({ name: 1 }).lean();
+  const result = products.map((p) => ({
+    id: String(p._id),
+    sku: p.sku,
+    barcode: p.barcode,
+    name: p.name,
+    category: p.category,
+    price: p.price,
+    tax_rate: p.tax_rate,
+    active: p.active
+  }));
+  res.json(result);
 });
 
 // Product lookup by barcode
-app.get('/api/products/barcode/:barcode', (req, res) => {
+app.get('/api/products/barcode/:barcode', async (req, res) => {
   const barcode = req.params.barcode;
-  const product = db
-    .prepare('SELECT * FROM products WHERE barcode = ? AND active = 1')
-    .get(barcode);
+  const product = await Product.findOne({ barcode, active: true }).lean();
 
   if (!product) {
     return res.status(404).json({ error: 'Product not found' });
   }
 
-  res.json(product);
+  return res.json({
+    id: String(product._id),
+    sku: product.sku,
+    barcode: product.barcode,
+    name: product.name,
+    category: product.category,
+    price: product.price,
+    tax_rate: product.tax_rate,
+    active: product.active
+  });
 });
 
 // Create a new product and initial inventory for a store (manager/admin)
-app.post('/api/products', requireRole('manager'), (req, res) => {
+app.post('/api/products', requireRole('manager'), async (req, res) => {
   const {
     sku,
     barcode,
@@ -322,47 +296,45 @@ app.post('/api/products', requireRole('manager'), (req, res) => {
     });
   }
 
-  const store = getStoreById(Number(storeId));
+  const store = await Store.findById(storeId).lean();
   if (!store) {
     return res.status(400).json({ error: 'Invalid storeId' });
   }
 
-  const insertProduct = db.prepare(
-    'INSERT INTO products (sku, barcode, name, category, price, tax_rate, active) VALUES (?, ?, ?, ?, ?, ?, 1)'
-  );
-
-  const insertInventory = db.prepare(
-    `
-    INSERT INTO inventory (store_id, product_id, quantity)
-    VALUES (?, ?, ?)
-    ON CONFLICT (store_id, product_id) DO UPDATE SET quantity = excluded.quantity
-  `
-  );
-
   try {
-    const productInfo = insertProduct.run(
+    const product = await Product.create({
       sku,
-      barcode || null,
+      barcode: barcode || null,
       name,
-      category || null,
-      Number(price),
-      Number(tax_rate)
-    );
-    const productId = productInfo.lastInsertRowid;
+      category: category || null,
+      price: Number(price),
+      tax_rate: Number(tax_rate),
+      active: true
+    });
+
     const qty = quantity != null ? Number(quantity) : 0;
+    await Inventory.findOneAndUpdate(
+      { store: store._id, product: product._id },
+      { $set: { quantity: qty } },
+      { upsert: true, new: true }
+    );
 
-    insertInventory.run(Number(storeId), productId, qty);
-
-    const product = db
-      .prepare('SELECT * FROM products WHERE id = ?')
-      .get(productId);
-
-    res.status(201).json(product);
+    return res.status(201).json({
+      id: String(product._id),
+      sku: product.sku,
+      barcode: product.barcode,
+      name: product.name,
+      category: product.category,
+      price: product.price,
+      tax_rate: product.tax_rate,
+      active: product.active
+    });
   } catch (err) {
-    if (String(err.message || '').includes('UNIQUE constraint failed: products.sku')) {
+    const msg = String(err.message || '');
+    if (msg.includes('duplicate key error') && msg.includes('sku')) {
       return res.status(400).json({ error: 'SKU already exists' });
     }
-    if (String(err.message || '').includes('UNIQUE constraint failed: products.barcode')) {
+    if (msg.includes('duplicate key error') && msg.includes('barcode')) {
       return res.status(400).json({ error: 'Barcode already exists' });
     }
     return res.status(500).json({ error: 'Failed to create product' });
@@ -370,16 +342,10 @@ app.post('/api/products', requireRole('manager'), (req, res) => {
 });
 
 // Update an existing product (manager/admin)
-app.put('/api/products/:id', requireRole('manager'), (req, res) => {
-  const id = Number(req.params.id);
-  if (!id) {
-    return res.status(400).json({ error: 'Invalid product id' });
-  }
+app.put('/api/products/:id', requireRole('manager'), async (req, res) => {
+  const id = req.params.id;
 
-  const existing = db
-    .prepare('SELECT * FROM products WHERE id = ?')
-    .get(id);
-
+  const existing = await Product.findById(id);
   if (!existing) {
     return res.status(404).json({ error: 'Product not found' });
   }
@@ -394,44 +360,33 @@ app.put('/api/products/:id', requireRole('manager'), (req, res) => {
     active
   } = req.body || {};
 
-  const updated = {
-    sku: sku != null ? sku : existing.sku,
-    barcode: barcode != null ? barcode : existing.barcode,
-    name: name != null ? name : existing.name,
-    category: category != null ? category : existing.category,
-    price: price != null ? Number(price) : existing.price,
-    tax_rate: tax_rate != null ? Number(tax_rate) : existing.tax_rate,
-    active: active != null ? (active ? 1 : 0) : existing.active
-  };
+  if (sku != null) existing.sku = sku;
+  if (barcode !== undefined) existing.barcode = barcode || null;
+  if (name != null) existing.name = name;
+  if (category !== undefined) existing.category = category || null;
+  if (price != null) existing.price = Number(price);
+  if (tax_rate != null) existing.tax_rate = Number(tax_rate);
+  if (active != null) existing.active = !!active;
 
   try {
-    db.prepare(
-      `
-      UPDATE products
-      SET sku = ?, barcode = ?, name = ?, category = ?, price = ?, tax_rate = ?, active = ?
-      WHERE id = ?
-    `
-    ).run(
-      updated.sku,
-      updated.barcode,
-      updated.name,
-      updated.category,
-      updated.price,
-      updated.tax_rate,
-      updated.active,
-      id
-    );
-
-    const product = db
-      .prepare('SELECT * FROM products WHERE id = ?')
-      .get(id);
-
-    res.json(product);
+    await existing.save();
+    const p = existing.toObject();
+    return res.json({
+      id: String(p._id),
+      sku: p.sku,
+      barcode: p.barcode,
+      name: p.name,
+      category: p.category,
+      price: p.price,
+      tax_rate: p.tax_rate,
+      active: p.active
+    });
   } catch (err) {
-    if (String(err.message || '').includes('UNIQUE constraint failed: products.sku')) {
+    const msg = String(err.message || '');
+    if (msg.includes('duplicate key error') && msg.includes('sku')) {
       return res.status(400).json({ error: 'SKU already exists' });
     }
-    if (String(err.message || '').includes('UNIQUE constraint failed: products.barcode')) {
+    if (msg.includes('duplicate key error') && msg.includes('barcode')) {
       return res.status(400).json({ error: 'Barcode already exists' });
     }
     return res.status(500).json({ error: 'Failed to update product' });
@@ -439,39 +394,34 @@ app.put('/api/products/:id', requireRole('manager'), (req, res) => {
 });
 
 // Inventory overview for a store
-app.get('/api/inventory', (req, res) => {
-  const storeId = Number(req.query.storeId);
+app.get('/api/inventory', async (req, res) => {
+  const storeId = req.query.storeId;
   if (!storeId) {
     return res.status(400).json({ error: 'storeId is required' });
   }
 
-  const rows = db
-    .prepare(
-      `
-      SELECT
-        i.store_id,
-        i.product_id,
-        i.quantity,
-        p.sku,
-        p.barcode,
-        p.name,
-        p.category,
-        p.price,
-        p.tax_rate,
-        p.active
-      FROM inventory i
-      JOIN products p ON p.id = i.product_id
-      WHERE i.store_id = ?
-      ORDER BY p.name
-    `
-    )
-    .all(storeId);
+  const rows = await Inventory.find({ store: storeId })
+    .populate('product')
+    .lean();
 
-  res.json(rows);
+  const result = rows.map((row) => ({
+    store_id: String(row.store),
+    product_id: String(row.product._id),
+    quantity: row.quantity,
+    sku: row.product.sku,
+    barcode: row.product.barcode,
+    name: row.product.name,
+    category: row.product.category,
+    price: row.product.price,
+    tax_rate: row.product.tax_rate,
+    active: row.product.active
+  }));
+
+  res.json(result);
 });
 
 // Set inventory quantity for a product in a store (manager/admin)
-app.post('/api/inventory/set', requireRole('manager'), (req, res) => {
+app.post('/api/inventory/set', requireRole('manager'), async (req, res) => {
   const { storeId, productId, quantity } = req.body || {};
   if (!storeId || !productId || quantity == null) {
     return res.status(400).json({
@@ -479,61 +429,47 @@ app.post('/api/inventory/set', requireRole('manager'), (req, res) => {
     });
   }
 
-  const store = getStoreById(Number(storeId));
+  const store = await Store.findById(storeId).lean();
   if (!store) {
     return res.status(400).json({ error: 'Invalid storeId' });
   }
 
-  const product = getProductById(Number(productId));
+  const product = await Product.findById(productId).lean();
   if (!product) {
     return res.status(400).json({ error: 'Invalid productId' });
   }
 
-  const setInventory = db.prepare(
-    `
-    INSERT INTO inventory (store_id, product_id, quantity)
-    VALUES (?, ?, ?)
-    ON CONFLICT (store_id, product_id) DO UPDATE SET quantity = excluded.quantity
-  `
-  );
+  const inv = await Inventory.findOneAndUpdate(
+    { store: storeId, product: productId },
+    { $set: { quantity: Number(quantity) } },
+    { upsert: true, new: true }
+  )
+    .populate('product')
+    .lean();
 
-  setInventory.run(Number(storeId), Number(productId), Number(quantity));
-
-  const updated = db
-    .prepare(
-      `
-      SELECT
-        i.store_id,
-        i.product_id,
-        i.quantity,
-        p.sku,
-        p.barcode,
-        p.name,
-        p.category,
-        p.price,
-        p.tax_rate,
-        p.active
-      FROM inventory i
-      JOIN products p ON p.id = i.product_id
-      WHERE i.store_id = ? AND i.product_id = ?
-    `
-    )
-    .get(Number(storeId), Number(productId));
-
-  res.json(updated);
+  return res.json({
+    store_id: String(inv.store),
+    product_id: String(inv.product._id),
+    quantity: inv.quantity,
+    sku: inv.product.sku,
+    barcode: inv.product.barcode,
+    name: inv.product.name,
+    category: inv.product.category,
+    price: inv.product.price,
+    tax_rate: inv.product.tax_rate,
+    active: inv.product.active
+  });
 });
 
 // Get receipt template for a store
-app.get('/api/stores/:storeId/receipt-template', (req, res) => {
-  const storeId = Number(req.params.storeId);
-  const store = getStoreById(storeId);
+app.get('/api/stores/:storeId/receipt-template', async (req, res) => {
+  const storeId = req.params.storeId;
+  const store = await Store.findById(storeId).lean();
   if (!store) {
     return res.status(404).json({ error: 'Store not found' });
   }
 
-  const template = db
-    .prepare('SELECT * FROM receipt_templates WHERE store_id = ?')
-    .get(storeId);
+  const template = await ReceiptTemplate.findOne({ store: storeId }).lean();
 
   if (!template) {
     return res.json({
@@ -541,49 +477,60 @@ app.get('/api/stores/:storeId/receipt-template', (req, res) => {
       header: '{{store_name}}\n{{store_address}}\n{{store_phone}}\n',
       footer:
         'Thank you for shopping with us!\nTC#: {{tc_number}}\nDate: {{date}}\nCashier: {{cashier_name}}\nType: {{tx_type}}\n',
-      options: JSON.stringify({ show_tax_breakdown: true })
+      options: { show_tax_breakdown: true }
     });
   }
 
-  res.json(template);
+  return res.json({
+    id: String(template._id),
+    store_id: String(template.store),
+    header: template.header || '',
+    footer: template.footer || '',
+    options: template.options || {}
+  });
 });
 
 // Update receipt template for a store (manager/admin)
-app.put('/api/stores/:storeId/receipt-template', requireRole('manager'), (req, res) => {
-  const storeId = Number(req.params.storeId);
-  const store = getStoreById(storeId);
-  if (!store) {
-    return res.status(404).json({ error: 'Store not found' });
+app.put(
+  '/api/stores/:storeId/receipt-template',
+  requireRole('manager'),
+  async (req, res) => {
+    const storeId = req.params.storeId;
+    const store = await Store.findById(storeId).lean();
+    if (!store) {
+      return res.status(404).json({ error: 'Store not found' });
+    }
+
+    const { header, footer, options } = req.body || {};
+    if (header == null || footer == null) {
+      return res.status(400).json({ error: 'header and footer are required' });
+    }
+
+    await ReceiptTemplate.findOneAndUpdate(
+      { store: storeId },
+      {
+        $set: {
+          header,
+          footer,
+          options: options || {}
+        }
+      },
+      { upsert: true }
+    );
+
+    const updated = await ReceiptTemplate.findOne({ store: storeId }).lean();
+    return res.json({
+      id: String(updated._id),
+      store_id: String(updated.store),
+      header: updated.header || '',
+      footer: updated.footer || '',
+      options: updated.options || {}
+    });
   }
-
-  const { header, footer, options } = req.body || {};
-  if (header == null || footer == null) {
-    return res.status(400).json({ error: 'header and footer are required' });
-  }
-
-  const existing = db
-    .prepare('SELECT id FROM receipt_templates WHERE store_id = ?')
-    .get(storeId);
-
-  if (existing) {
-    db.prepare(
-      'UPDATE receipt_templates SET header = ?, footer = ?, options = ? WHERE store_id = ?'
-    ).run(header, footer, options ? JSON.stringify(options) : null, storeId);
-  } else {
-    db.prepare(
-      'INSERT INTO receipt_templates (store_id, header, footer, options) VALUES (?, ?, ?, ?)'
-    ).run(storeId, header, footer, options ? JSON.stringify(options) : null);
-  }
-
-  const updated = db
-    .prepare('SELECT * FROM receipt_templates WHERE store_id = ?')
-    .get(storeId);
-
-  res.json(updated);
-});
+);
 
 // Create a transaction (checkout)
-app.post('/api/transactions', (req, res) => {
+app.post('/api/transactions', async (req, res) => {
   const {
     storeId,
     registerId,
@@ -601,13 +548,13 @@ app.post('/api/transactions', (req, res) => {
     return res.status(400).json({ error: 'paymentMethod is required' });
   }
 
-  const store = getStoreById(storeId);
+  const store = await Store.findById(storeId).lean();
   if (!store) {
     return res.status(400).json({ error: 'Invalid storeId' });
   }
 
-  const register = getRegisterById(registerId);
-  if (!register || register.store_id !== storeId) {
+  const register = await Register.findOne({ _id: registerId, store: storeId }).lean();
+  if (!register) {
     return res.status(400).json({ error: 'Invalid registerId for store' });
   }
 
@@ -617,14 +564,14 @@ app.post('/api/transactions', (req, res) => {
   const cartItems = [];
 
   for (const item of items) {
-    const productId = Number(item.productId);
+    const productId = item.productId;
     const quantity = Number(item.quantity);
     if (!productId || !quantity || quantity <= 0) {
       return res.status(400).json({ error: 'Invalid item in items array' });
     }
 
-    const product = getProductById(productId);
-    if (!product) {
+    const product = await Product.findById(productId).lean();
+    if (!product || !product.active) {
       return res.status(400).json({ error: `Invalid productId: ${productId}` });
     }
 
@@ -645,163 +592,166 @@ app.post('/api/transactions', (req, res) => {
   }
 
   const total = subtotal + taxTotal;
-  const createdAt = new Date().toISOString();
+  const createdAt = new Date();
   const cashierId = req.user ? req.user.id : null;
   const cashierName = req.user ? req.user.username : '';
 
-  const insertTransaction = db.prepare(
-    `
-    INSERT INTO transactions
-      (store_id, register_id, cashier_id, cashier_name, subtotal, tax_total, total, payment_method, type, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SALE', ?)
-  `
-  );
-
-  const insertItem = db.prepare(
-    `
-    INSERT INTO transaction_items
-      (transaction_id, product_id, quantity, unit_price, line_total, tax_amount)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `
-  );
-
-  const updateInventory = db.prepare(
-    `
-    UPDATE inventory
-    SET quantity = quantity - ?
-    WHERE store_id = ? AND product_id = ?
-  `
-  );
-
-  const txWrapper = db.transaction(() => {
-    const info = insertTransaction.run(
-      storeId,
-      registerId,
-      cashierId,
-      cashierName,
-      subtotal,
-      taxTotal,
-      total,
-      paymentMethod,
-      createdAt
-    );
-    const transactionId = info.lastInsertRowid;
-
-    const tc = generateTC({
-      storeCode: store.code,
-      registerCode: register.code,
-      transactionId,
-      date: new Date(createdAt)
-    });
-
-    db.prepare('UPDATE transactions SET tc_number = ? WHERE id = ?').run(
-      tc,
-      transactionId
-    );
-
-    for (const item of cartItems) {
-      insertItem.run(
-        transactionId,
-        item.product.id,
-        item.quantity,
-        item.unitPrice,
-        item.lineTotal,
-        item.taxAmount
-      );
-
-      updateInventory.run(item.quantity, storeId, item.product.id);
-    }
-
-    const receiptText = renderTextReceipt(transactionId);
-
-    const txRow = db
-      .prepare('SELECT * FROM transactions WHERE id = ?')
-      .get(transactionId);
-
-    const txItems = db
-      .prepare(
-        `
-        SELECT
-          ti.*,
-          p.name AS product_name,
-          p.barcode,
-          p.sku
-        FROM transaction_items ti
-        JOIN products p ON p.id = ti.product_id
-        WHERE ti.transaction_id = ?
-      `
-      )
-      .all(transactionId);
-
-    return {
-      transaction: txRow,
-      items: txItems,
-      receiptText
-    };
-  });
+  const session = await Transaction.startSession();
+  let result;
 
   try {
-    const result = txWrapper();
-    // Best-effort auto-print via local/remote print agent
-    sendToPrintAgent(result.transaction.id);
-    res.json(result);
+    await session.withTransaction(async () => {
+      const tx = await Transaction.create(
+        [
+          {
+            store: storeId,
+            register: registerId,
+            cashier: cashierId || null,
+            cashier_name: cashierName,
+            subtotal,
+            tax_total: taxTotal,
+            total,
+            payment_method: paymentMethod,
+            type: 'SALE',
+            created_at: createdAt
+          }
+        ],
+        { session }
+      );
+      const transaction = tx[0];
+
+      const tc = generateTC({
+        storeCode: store.code,
+        registerCode: register.code,
+        transactionId: transaction._id.toString(),
+        date: createdAt
+      });
+
+      transaction.tc_number = tc;
+      await transaction.save({ session });
+
+      const itemDocs = cartItems.map((item) => ({
+        transaction: transaction._id,
+        product: item.product._id,
+        product_name: item.product.name,
+        sku: item.product.sku,
+        barcode: item.product.barcode,
+        category: item.product.category,
+        quantity: item.quantity,
+        unit_price: item.unitPrice,
+        line_total: item.lineTotal,
+        tax_amount: item.taxAmount
+      }));
+
+      await TransactionItem.insertMany(itemDocs, { session });
+
+      for (const item of cartItems) {
+        await Inventory.findOneAndUpdate(
+          { store: storeId, product: item.product._id },
+          { $inc: { quantity: -item.quantity } },
+          { upsert: true, session }
+        );
+      }
+
+      const receiptText = await renderTextReceipt(transaction._id);
+
+      const txObj = transaction.toObject();
+      const itemsOut = itemDocs.map((it, idx) => ({
+        id: String(idx),
+        transaction_id: String(transaction._id),
+        product_id: String(it.product),
+        product_name: it.product_name,
+        barcode: it.barcode,
+        sku: it.sku,
+        quantity: it.quantity,
+        unit_price: it.unit_price,
+        line_total: it.line_total,
+        tax_amount: it.tax_amount
+      }));
+
+      result = {
+        transaction: {
+          id: String(txObj._id),
+          store_id: String(txObj.store),
+          register_id: String(txObj.register),
+          cashier_id: txObj.cashier ? String(txObj.cashier) : null,
+          cashier_name: txObj.cashier_name,
+          subtotal: txObj.subtotal,
+          tax_total: txObj.tax_total,
+          total: txObj.total,
+          payment_method: txObj.payment_method,
+          tc_number: txObj.tc_number,
+          type: txObj.type,
+          created_at: txObj.created_at
+        },
+        items: itemsOut,
+        receiptText
+      };
+    });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to create transaction' });
+    await session.endSession();
+    return res.status(500).json({ error: 'Failed to create transaction' });
   }
+
+  await session.endSession();
+  sendToPrintAgent(result.transaction.id);
+  return res.json(result);
 });
 
 // Look up a transaction by TC#
-app.get('/api/transactions/by-tc/:tcNumber', (req, res) => {
+app.get('/api/transactions/by-tc/:tcNumber', async (req, res) => {
   const tcNumber = req.params.tcNumber;
 
-  const tx = db
-    .prepare(
-      `
-      SELECT
-        t.*,
-        s.name AS store_name,
-        s.code AS store_code,
-        r.code AS register_code,
-        r.name AS register_name
-      FROM transactions t
-      JOIN stores s ON s.id = t.store_id
-      JOIN registers r ON r.id = t.register_id
-      WHERE t.tc_number = ?
-    `
-    )
-    .get(tcNumber);
+  const tx = await Transaction.findOne({ tc_number: tcNumber })
+    .populate('store')
+    .populate('register')
+    .lean();
 
   if (!tx) {
     return res.status(404).json({ error: 'Transaction not found' });
   }
 
-  const items = db
-    .prepare(
-      `
-      SELECT
-        ti.*,
-        p.name AS product_name,
-        p.barcode,
-        p.sku
-      FROM transaction_items ti
-      JOIN products p ON p.id = ti.product_id
-      WHERE ti.transaction_id = ?
-    `
-    )
-    .all(tx.id);
+  const items = await TransactionItem.find({ transaction: tx._id }).lean();
 
-  res.json({
-    transaction: tx,
-    items
+  const itemsOut = items.map((it) => ({
+    id: String(it._id),
+    transaction_id: String(it.transaction),
+    product_id: String(it.product),
+    product_name: it.product_name,
+    barcode: it.barcode,
+    sku: it.sku,
+    quantity: it.quantity,
+    unit_price: it.unit_price,
+    line_total: it.line_total,
+    tax_amount: it.tax_amount
+  }));
+
+  return res.json({
+    transaction: {
+      id: String(tx._id),
+      store_id: String(tx.store._id),
+      store_name: tx.store.name,
+      store_code: tx.store.code,
+      register_id: String(tx.register._id),
+      register_name: tx.register.name,
+      register_code: tx.register.code,
+      cashier_id: tx.cashier ? String(tx.cashier) : null,
+      cashier_name: tx.cashier_name,
+      subtotal: tx.subtotal,
+      tax_total: tx.tax_total,
+      total: tx.total,
+      payment_method: tx.payment_method,
+      tc_number: tx.tc_number,
+      type: tx.type,
+      created_at: tx.created_at
+    },
+    items: itemsOut
   });
 });
 
 // Create a refund transaction referencing an existing sale
-app.post('/api/transactions/:id/refund', (req, res) => {
-  const originalId = Number(req.params.id);
-  if (!originalId) {
-    return res.status(400).json({ error: 'Invalid transaction id' });
-  }
+app.post('/api/transactions/:id/refund', async (req, res) => {
+  const originalId = req.params.id;
 
   const { items } = req.body || {};
   if (!Array.isArray(items) || items.length === 0) {
@@ -810,20 +760,10 @@ app.post('/api/transactions/:id/refund', (req, res) => {
       .json({ error: 'items is required and must be non-empty' });
   }
 
-  const original = db
-    .prepare(
-      `
-      SELECT
-        t.*,
-        s.code AS store_code,
-        r.code AS register_code
-      FROM transactions t
-      JOIN stores s ON s.id = t.store_id
-      JOIN registers r ON r.id = t.register_id
-      WHERE t.id = ?
-    `
-    )
-    .get(originalId);
+  const original = await Transaction.findById(originalId)
+    .populate('store')
+    .populate('register')
+    .lean();
 
   if (!original) {
     return res.status(404).json({ error: 'Original transaction not found' });
@@ -835,19 +775,9 @@ app.post('/api/transactions/:id/refund', (req, res) => {
       .json({ error: 'Only SALE transactions can be refunded' });
   }
 
-  const originalItems = db
-    .prepare(
-      `
-      SELECT
-        ti.*,
-        p.name AS product_name,
-        p.tax_rate
-      FROM transaction_items ti
-      JOIN products p ON p.id = ti.product_id
-      WHERE ti.transaction_id = ?
-    `
-    )
-    .all(originalId);
+  const originalItems = await TransactionItem.find({
+    transaction: original._id
+  }).lean();
 
   if (originalItems.length === 0) {
     return res
@@ -857,7 +787,7 @@ app.post('/api/transactions/:id/refund', (req, res) => {
 
   const originalById = new Map();
   originalItems.forEach((row) => {
-    originalById.set(row.id, row);
+    originalById.set(String(row._id), row);
   });
 
   const refundLines = [];
@@ -865,7 +795,7 @@ app.post('/api/transactions/:id/refund', (req, res) => {
   let taxTotal = 0;
 
   for (const item of items) {
-    const tiId = Number(item.transactionItemId);
+    const tiId = String(item.transactionItemId);
     const qty = Number(item.quantity);
     if (!tiId || !qty || qty <= 0) {
       return res
@@ -880,7 +810,7 @@ app.post('/api/transactions/:id/refund', (req, res) => {
         .json({ error: `Invalid transactionItemId: ${tiId}` });
     }
 
-    if (qty > originalItem.quantity) {
+    if (qty > Math.abs(originalItem.quantity)) {
       return res.status(400).json({
         error: `Refund quantity for item ${tiId} exceeds original quantity`
       });
@@ -889,8 +819,8 @@ app.post('/api/transactions/:id/refund', (req, res) => {
     const unitPrice = originalItem.unit_price;
     const perUnitTax =
       originalItem.quantity !== 0
-        ? originalItem.tax_amount / originalItem.quantity
-        : (unitPrice * originalItem.tax_rate) / 100;
+        ? originalItem.tax_amount / Math.abs(originalItem.quantity)
+        : 0;
 
     const lineSubtotal = unitPrice * qty;
     const lineTax = perUnitTax * qty;
@@ -912,122 +842,122 @@ app.post('/api/transactions/:id/refund', (req, res) => {
   }
 
   const total = -(subtotal + taxTotal); // refund is negative total
-  const createdAt = new Date().toISOString();
+  const createdAt = new Date();
   const cashierId = req.user ? req.user.id : null;
   const cashierName = req.user ? req.user.username : '';
 
-  const insertTransaction = db.prepare(
-    `
-    INSERT INTO transactions
-      (store_id, register_id, cashier_id, cashier_name, subtotal, tax_total, total, payment_method, type, reference_transaction_id, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'REFUND', ?, ?)
-  `
-  );
-
-  const insertItem = db.prepare(
-    `
-    INSERT INTO transaction_items
-      (transaction_id, product_id, quantity, unit_price, line_total, tax_amount)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `
-  );
-
-  const updateInventory = db.prepare(
-    `
-    UPDATE inventory
-    SET quantity = quantity + ?
-    WHERE store_id = ? AND product_id = ?
-  `
-  );
-
-  const txWrapper = db.transaction(() => {
-    const info = insertTransaction.run(
-      original.store_id,
-      original.register_id,
-      cashierId,
-      cashierName,
-      -subtotal,
-      -taxTotal,
-      total,
-      original.payment_method,
-      originalId,
-      createdAt
-    );
-    const refundId = info.lastInsertRowid;
-
-    const tc = generateTC({
-      storeCode: original.store_code,
-      registerCode: original.register_code,
-      transactionId: refundId,
-      date: new Date(createdAt)
-    });
-
-    db.prepare('UPDATE transactions SET tc_number = ? WHERE id = ?').run(
-      tc,
-      refundId
-    );
-
-    for (const line of refundLines) {
-      const negativeQty = -line.quantity;
-      const negativeLineTotal = -line.lineSubtotal;
-      const negativeTax = -line.lineTax;
-
-      insertItem.run(
-        refundId,
-        line.originalItem.product_id,
-        negativeQty,
-        line.unitPrice,
-        negativeLineTotal,
-        negativeTax
-      );
-
-      updateInventory.run(
-        line.quantity,
-        original.store_id,
-        line.originalItem.product_id
-      );
-    }
-
-    const receiptText = renderTextReceipt(refundId);
-
-    const txRow = db
-      .prepare('SELECT * FROM transactions WHERE id = ?')
-      .get(refundId);
-
-    const txItems = db
-      .prepare(
-        `
-        SELECT
-          ti.*,
-          p.name AS product_name,
-          p.barcode,
-          p.sku
-        FROM transaction_items ti
-        JOIN products p ON p.id = ti.product_id
-        WHERE ti.transaction_id = ?
-      `
-      )
-      .all(refundId);
-
-    return {
-      transaction: txRow,
-      items: txItems,
-      receiptText
-    };
-  });
+  const session = await Transaction.startSession();
+  let result;
 
   try {
-    const result = txWrapper();
-    // Best-effort auto-print via local/remote print agent
-    sendToPrintAgent(result.transaction.id);
-    res.json(result);
+    await session.withTransaction(async () => {
+      const txArr = await Transaction.create(
+        [
+          {
+            store: original.store._id,
+            register: original.register._id,
+            cashier: cashierId || null,
+            cashier_name: cashierName,
+            subtotal: -subtotal,
+            tax_total: -taxTotal,
+            total,
+            payment_method: original.payment_method,
+            type: 'REFUND',
+            reference_transaction: original._id,
+            created_at: createdAt
+          }
+        ],
+        { session }
+      );
+
+      const refundTx = txArr[0];
+
+      const tc = generateTC({
+        storeCode: original.store.code,
+        registerCode: original.register.code,
+        transactionId: refundTx._id.toString(),
+        date: createdAt
+      });
+
+      refundTx.tc_number = tc;
+      await refundTx.save({ session });
+
+      const refundItemDocs = [];
+
+      for (const line of refundLines) {
+        const negativeQty = -line.quantity;
+        const negativeLineTotal = -line.lineSubtotal;
+        const negativeTax = -line.lineTax;
+
+        refundItemDocs.push({
+          transaction: refundTx._id,
+          product: line.originalItem.product,
+          product_name: line.originalItem.product_name,
+          sku: line.originalItem.sku,
+          barcode: line.originalItem.barcode,
+          category: line.originalItem.category,
+          quantity: negativeQty,
+          unit_price: line.unitPrice,
+          line_total: negativeLineTotal,
+          tax_amount: negativeTax
+        });
+
+        await Inventory.findOneAndUpdate(
+          { store: original.store._id, product: line.originalItem.product },
+          { $inc: { quantity: line.quantity } },
+          { upsert: true, session }
+        );
+      }
+
+      await TransactionItem.insertMany(refundItemDocs, { session });
+
+      const receiptText = await renderTextReceipt(refundTx._id);
+
+      const refundObj = refundTx.toObject();
+      const itemsOut = refundItemDocs.map((it, idx) => ({
+        id: String(idx),
+        transaction_id: String(refundObj._id),
+        product_id: String(it.product),
+        product_name: it.product_name,
+        barcode: it.barcode,
+        sku: it.sku,
+        quantity: it.quantity,
+        unit_price: it.unit_price,
+        line_total: it.line_total,
+        tax_amount: it.tax_amount
+      }));
+
+      result = {
+        transaction: {
+          id: String(refundObj._id),
+          store_id: String(refundObj.store),
+          register_id: String(refundObj.register),
+          cashier_id: refundObj.cashier ? String(refundObj.cashier) : null,
+          cashier_name: refundObj.cashier_name,
+          subtotal: refundObj.subtotal,
+          tax_total: refundObj.tax_total,
+          total: refundObj.total,
+          payment_method: refundObj.payment_method,
+          tc_number: refundObj.tc_number,
+          type: refundObj.type,
+          created_at: refundObj.created_at
+        },
+        items: itemsOut,
+        receiptText
+      };
+    });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to create refund transaction' });
+    await session.endSession();
+    return res.status(500).json({ error: 'Failed to create refund transaction' });
   }
+
+  await session.endSession();
+  sendToPrintAgent(result.transaction.id);
+  return res.json(result);
 });
 
 // Reports - sales summary (manager/admin)
-app.get('/api/reports/sales-summary', requireRole('manager'), (req, res) => {
+app.get('/api/reports/sales-summary', requireRole('manager'), async (req, res) => {
   let { from, to, storeId } = req.query;
 
   const today = new Date();
@@ -1042,108 +972,140 @@ app.get('/api/reports/sales-summary', requireRole('manager'), (req, res) => {
     from = d.toISOString().slice(0, 10);
   }
 
-  const params = [from, to];
-  let storeClause = '';
+  const fromDate = new Date(`${from}T00:00:00.000Z`);
+  const toDate = new Date(`${to}T23:59:59.999Z`);
+
+  const match = {
+    created_at: { $gte: fromDate, $lte: toDate }
+  };
 
   if (storeId) {
-    const numericStoreId = Number(storeId);
-    if (!numericStoreId) {
-      return res.status(400).json({ error: 'Invalid storeId' });
-    }
-    storeClause = ' AND t.store_id = ?';
-    params.push(numericStoreId);
+    match.store = storeId;
   } else if (req.user.role !== 'admin' && req.user.storeId) {
-    storeClause = ' AND t.store_id = ?';
-    params.push(Number(req.user.storeId));
+    match.store = req.user.storeId;
   }
 
-  const summaryRow = db
-    .prepare(
-      `
-      SELECT
-        SUM(CASE WHEN t.type = 'SALE' THEN t.total ELSE 0 END) AS sales_total,
-        SUM(CASE WHEN t.type = 'REFUND' THEN t.total ELSE 0 END) AS refunds_total,
-        SUM(t.total) AS net_total,
-        COUNT(*) AS tx_count
-      FROM transactions t
-      WHERE date(t.created_at) BETWEEN ? AND ?${storeClause}
-    `
-    )
-    .get(...params) || {};
+  const summaryAgg = await Transaction.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: null,
+        sales_total: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'SALE'] }, '$total', 0]
+          }
+        },
+        refunds_total: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'REFUND'] }, '$total', 0]
+          }
+        },
+        net_total: { $sum: '$total' },
+        tx_count: { $sum: 1 }
+      }
+    }
+  ]).exec();
 
-  const byDay = db
-    .prepare(
-      `
-      SELECT
-        date(t.created_at) AS day,
-        SUM(CASE WHEN t.type = 'SALE' THEN t.total ELSE 0 END) AS sales_total,
-        SUM(CASE WHEN t.type = 'REFUND' THEN t.total ELSE 0 END) AS refunds_total,
-        SUM(t.total) AS net_total,
-        COUNT(*) AS tx_count
-      FROM transactions t
-      WHERE date(t.created_at) BETWEEN ? AND ?${storeClause}
-      GROUP BY day
-      ORDER BY day
-    `
-    )
-    .all(...params);
+  const summaryRow = summaryAgg[0] || {};
 
-  const byCashier = db
-    .prepare(
-      `
-      SELECT
-        COALESCE(u.username, t.cashier_name, 'Unknown') AS cashier_name,
-        SUM(CASE WHEN t.type = 'SALE' THEN t.total ELSE 0 END) AS sales_total,
-        SUM(CASE WHEN t.type = 'REFUND' THEN t.total ELSE 0 END) AS refunds_total,
-        SUM(t.total) AS net_total,
-        COUNT(*) AS tx_count
-      FROM transactions t
-      LEFT JOIN users u ON u.id = t.cashier_id
-      WHERE date(t.created_at) BETWEEN ? AND ?${storeClause}
-      GROUP BY cashier_name
-      ORDER BY cashier_name
-    `
-    )
-    .all(...params);
+  const byDay = await Transaction.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: {
+          $dateToString: { format: '%Y-%m-%d', date: '$created_at' }
+        },
+        sales_total: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'SALE'] }, '$total', 0]
+          }
+        },
+        refunds_total: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'REFUND'] }, '$total', 0]
+          }
+        },
+        net_total: { $sum: '$total' },
+        tx_count: { $sum: 1 }
+      }
+    },
+    { $sort: { _id: 1 } }
+  ]).exec();
 
-  const byProduct = db
-    .prepare(
-      `
-      SELECT
-        p.id AS product_id,
-        p.name AS product_name,
-        p.sku,
-        p.barcode,
-        SUM(ti.quantity) AS net_qty,
-        SUM(ti.line_total) AS net_sales,
-        SUM(ti.tax_amount) AS net_tax
-      FROM transactions t
-      JOIN transaction_items ti ON ti.transaction_id = t.id
-      JOIN products p ON p.id = ti.product_id
-      WHERE date(t.created_at) BETWEEN ? AND ?${storeClause}
-      GROUP BY p.id, p.name, p.sku, p.barcode
-      ORDER BY net_sales DESC
-    `
-    )
-    .all(...params);
+  const byCashier = await Transaction.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: {
+          $ifNull: ['$cashier_name', 'Unknown']
+        },
+        sales_total: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'SALE'] }, '$total', 0]
+          }
+        },
+        refunds_total: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'REFUND'] }, '$total', 0]
+          }
+        },
+        net_total: { $sum: '$total' },
+        tx_count: { $sum: 1 }
+      }
+    },
+    { $sort: { _id: 1 } }
+  ]).exec();
 
-  const byCategory = db
-    .prepare(
-      `
-      SELECT
-        COALESCE(p.category, 'Uncategorized') AS category,
-        SUM(ti.quantity) AS net_qty,
-        SUM(ti.line_total) AS net_sales,
-        SUM(ti.tax_amount) AS net_tax
-      FROM transactions t
-      JOIN transaction_items ti ON ti.transaction_id = t.id
-      JOIN products p ON p.id = ti.product_id
-      WHERE date(t.created_at) BETWEEN ? AND ?${storeClause}
-      GROUP BY category
-      ORDER BY net_sales DESC
-    `
-    )
-    .all(...params);
+  const txMatch = match;
+
+  const byProduct = await TransactionItem.aggregate([
+    {
+      $lookup: {
+        from: 'transactions',
+        localField: 'transaction',
+        foreignField: '_id',
+        as: 'tx'
+      }
+    },
+    { $unwind: '$tx' },
+    { $match: { 'tx.created_at': txMatch.created_at, ...(txMatch.store && { 'tx.store': txMatch.store }) } },
+    {
+      $group: {
+        _id: '$product',
+        product_name: { $first: '$product_name' },
+        sku: { $first: '$sku' },
+        barcode: { $first: '$barcode' },
+        net_qty: { $sum: '$quantity' },
+        net_sales: { $sum: '$line_total' },
+        net_tax: { $sum: '$tax_amount' }
+      }
+    },
+    { $sort: { net_sales: -1 } }
+  ]).exec();
+
+  const byCategory = await TransactionItem.aggregate([
+    {
+      $lookup: {
+        from: 'transactions',
+        localField: 'transaction',
+        foreignField: '_id',
+        as: 'tx'
+      }
+    },
+    { $unwind: '$tx' },
+    { $match: { 'tx.created_at': txMatch.created_at, ...(txMatch.store && { 'tx.store': txMatch.store }) } },
+    {
+      $group: {
+        _id: {
+          $ifNull: ['$category', 'Uncategorized']
+        },
+        net_qty: { $sum: '$quantity' },
+        net_sales: { $sum: '$line_total' },
+        net_tax: { $sum: '$tax_amount' }
+      }
+    },
+    { $sort: { net_sales: -1 } }
+  ]).exec();
 
   const summary = {
     sales_total: summaryRow.sales_total || 0,
@@ -1155,32 +1117,64 @@ app.get('/api/reports/sales-summary', requireRole('manager'), (req, res) => {
   res.json({
     range: { from, to, storeId: storeId || null },
     summary,
-    byDay,
-    byCashier,
-    byProduct,
-    byCategory
+    byDay: byDay.map((row) => ({
+      day: row._id,
+      sales_total: row.sales_total,
+      refunds_total: row.refunds_total,
+      net_total: row.net_total,
+      tx_count: row.tx_count
+    })),
+    byCashier: byCashier.map((row) => ({
+      cashier_name: row._id,
+      sales_total: row.sales_total,
+      refunds_total: row.refunds_total,
+      net_total: row.net_total,
+      tx_count: row.tx_count
+    })),
+    byProduct: byProduct.map((row) => ({
+      product_id: String(row._id),
+      product_name: row.product_name,
+      sku: row.sku,
+      barcode: row.barcode,
+      net_qty: row.net_qty,
+      net_sales: row.net_sales,
+      net_tax: row.net_tax
+    })),
+    byCategory: byCategory.map((row) => ({
+      category: row._id,
+      net_qty: row.net_qty,
+      net_sales: row.net_sales,
+      net_tax: row.net_tax
+    }))
   });
 });
 
 // Get receipt text for a transaction
-app.get('/api/transactions/:id/receipt', (req, res) => {
-  const id = Number(req.params.id);
-  if (!id) {
-    return res.status(400).json({ error: 'Invalid id' });
-  }
+app.get('/api/transactions/:id/receipt', async (req, res) => {
+  const id = req.params.id;
 
-  const txRow = db
-    .prepare('SELECT * FROM transactions WHERE id = ?')
-    .get(id);
-
-  if (!txRow) {
+  const tx = await Transaction.findById(id).lean();
+  if (!tx) {
     return res.status(404).json({ error: 'Transaction not found' });
   }
 
   try {
-    const receiptText = renderTextReceipt(id);
+    const receiptText = await renderTextReceipt(id);
     res.json({
-      transaction: txRow,
+      transaction: {
+        id: String(tx._id),
+        store_id: String(tx.store),
+        register_id: String(tx.register),
+        cashier_id: tx.cashier ? String(tx.cashier) : null,
+        cashier_name: tx.cashier_name,
+        subtotal: tx.subtotal,
+        tax_total: tx.tax_total,
+        total: tx.total,
+        payment_method: tx.payment_method,
+        tc_number: tx.tc_number,
+        type: tx.type,
+        created_at: tx.created_at
+      },
       receiptText
     });
   } catch (err) {
@@ -1188,7 +1182,10 @@ app.get('/api/transactions/:id/receipt', (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`POS API listening on http://localhost:${PORT}`);
-});
+(async () => {
+  await initDb();
+  app.listen(PORT, () => {
+    // eslint-disable-next-line no-console
+    console.log(`POS API listening on http://localhost:${PORT}`);
+  });
+})();

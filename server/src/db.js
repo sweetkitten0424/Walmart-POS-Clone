@@ -1,156 +1,120 @@
-const Database = require('better-sqlite3');
-const path = require('path');
-const fs = require('fs');
+const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
-const dbPath = path.join(__dirname, '../data/pos.sqlite');
-const dbDir = path.dirname(dbPath);
+const { Schema } = mongoose;
 
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
-}
+const MONGODB_URI =
+  process.env.MONGODB_URI ||
+  'mongodb://localhost:27017/pos-dev'; // fallback for local dev
 
-const db = new Database(dbPath);
+// Schemas
+const StoreSchema = new Schema({
+  code: { type: String, unique: true, required: true },
+  name: { type: String, required: true },
+  address: String,
+  phone: String
+});
 
-function initDb() {
-  db.pragma('foreign_keys = ON');
+const RegisterSchema = new Schema({
+  store: { type: Schema.Types.ObjectId, ref: 'Store', required: true },
+  code: { type: String, required: true },
+  name: { type: String, required: true }
+});
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS stores (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      code TEXT NOT NULL UNIQUE,
-      name TEXT NOT NULL,
-      address TEXT,
-      phone TEXT
-    );
+const ProductSchema = new Schema({
+  sku: { type: String, unique: true, required: true },
+  barcode: { type: String, unique: true, sparse: true },
+  name: { type: String, required: true },
+  category: String,
+  price: { type: Number, required: true },
+  tax_rate: { type: Number, default: 0 },
+  active: { type: Boolean, default: true }
+});
 
-    CREATE TABLE IF NOT EXISTS registers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      store_id INTEGER NOT NULL,
-      code TEXT NOT NULL,
-      name TEXT NOT NULL,
-      FOREIGN KEY (store_id) REFERENCES stores(id)
-    );
+const InventorySchema = new Schema({
+  store: { type: Schema.Types.ObjectId, ref: 'Store', required: true },
+  product: { type: Schema.Types.ObjectId, ref: 'Product', required: true },
+  quantity: { type: Number, default: 0 }
+});
+InventorySchema.index({ store: 1, product: 1 }, { unique: true });
 
-    CREATE TABLE IF NOT EXISTS products (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      sku TEXT NOT NULL UNIQUE,
-      barcode TEXT UNIQUE,
-      name TEXT NOT NULL,
-      category TEXT,
-      price REAL NOT NULL,
-      tax_rate REAL NOT NULL DEFAULT 0,
-      active INTEGER NOT NULL DEFAULT 1
-    );
+const ReceiptTemplateSchema = new Schema({
+  store: { type: Schema.Types.ObjectId, ref: 'Store', unique: true, required: true },
+  header: String,
+  footer: String,
+  options: Schema.Types.Mixed
+});
 
-    CREATE TABLE IF NOT EXISTS inventory (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      store_id INTEGER NOT NULL,
-      product_id INTEGER NOT NULL,
-      quantity REAL NOT NULL DEFAULT 0,
-      FOREIGN KEY (store_id) REFERENCES stores(id),
-      FOREIGN KEY (product_id) REFERENCES products(id),
-      UNIQUE (store_id, product_id)
-    );
+const UserSchema = new Schema({
+  username: { type: String, unique: true, required: true },
+  password_hash: { type: String, required: true },
+  role: { type: String, enum: ['admin', 'manager', 'cashier'], required: true },
+  store: { type: Schema.Types.ObjectId, ref: 'Store', default: null }
+});
 
-    CREATE TABLE IF NOT EXISTS receipt_templates (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      store_id INTEGER NOT NULL UNIQUE,
-      header TEXT,
-      footer TEXT,
-      options TEXT,
-      FOREIGN KEY (store_id) REFERENCES stores(id)
-    );
+const TransactionSchema = new Schema({
+  store: { type: Schema.Types.ObjectId, ref: 'Store', required: true },
+  register: { type: Schema.Types.ObjectId, ref: 'Register', required: true },
+  cashier: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+  cashier_name: String,
+  subtotal: { type: Number, required: true },
+  tax_total: { type: Number, required: true },
+  total: { type: Number, required: true },
+  payment_method: { type: String, required: true },
+  tc_number: { type: String, unique: true },
+  type: { type: String, enum: ['SALE', 'REFUND'], default: 'SALE' },
+  reference_transaction: {
+    type: Schema.Types.ObjectId,
+    ref: 'Transaction',
+    default: null
+  },
+  created_at: { type: Date, required: true }
+});
 
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL,
-      store_id INTEGER,
-      FOREIGN KEY (store_id) REFERENCES stores(id)
-    );
+const TransactionItemSchema = new Schema({
+  transaction: { type: Schema.Types.ObjectId, ref: 'Transaction', required: true },
+  product: { type: Schema.Types.ObjectId, ref: 'Product', required: true },
+  // denormalised for easier reporting
+  product_name: { type: String, required: true },
+  sku: String,
+  barcode: String,
+  category: String,
+  quantity: { type: Number, required: true },
+  unit_price: { type: Number, required: true },
+  line_total: { type: Number, required: true },
+  tax_amount: { type: Number, required: true }
+});
 
-    CREATE TABLE IF NOT EXISTS transactions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      store_id INTEGER NOT NULL,
-      register_id INTEGER NOT NULL,
-      cashier_id INTEGER,
-      cashier_name TEXT,
-      subtotal REAL NOT NULL,
-      tax_total REAL NOT NULL,
-      total REAL NOT NULL,
-      payment_method TEXT NOT NULL,
-      tc_number TEXT UNIQUE,
-      type TEXT NOT NULL DEFAULT 'SALE',
-      reference_transaction_id INTEGER,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (store_id) REFERENCES stores(id),
-      FOREIGN KEY (register_id) REFERENCES registers(id),
-      FOREIGN KEY (cashier_id) REFERENCES users(id),
-      FOREIGN KEY (reference_transaction_id) REFERENCES transactions(id)
-    );
+// Models
+const Store = mongoose.model('Store', StoreSchema);
+const Register = mongoose.model('Register', RegisterSchema);
+const Product = mongoose.model('Product', ProductSchema);
+const Inventory = mongoose.model('Inventory', InventorySchema);
+const ReceiptTemplate = mongoose.model('ReceiptTemplate', ReceiptTemplateSchema);
+const User = mongoose.model('User', UserSchema);
+const Transaction = mongoose.model('Transaction', TransactionSchema);
+const TransactionItem = mongoose.model('TransactionItem', TransactionItemSchema);
 
-    CREATE TABLE IF NOT EXISTS transaction_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      transaction_id INTEGER NOT NULL,
-      product_id INTEGER NOT NULL,
-      quantity REAL NOT NULL,
-      unit_price REAL NOT NULL,
-      line_total REAL NOT NULL,
-      tax_amount REAL NOT NULL,
-      FOREIGN KEY (transaction_id) REFERENCES transactions(id),
-      FOREIGN KEY (product_id) REFERENCES products(id)
-    );
-  `);
-
-  // In case the database was created with an older schema, try to add missing columns.
-  try {
-    db.exec(`ALTER TABLE transactions ADD COLUMN type TEXT NOT NULL DEFAULT 'SALE'`);
-  } catch (err) {
-    // ignore if column already exists
-  }
-  try {
-    db.exec(`ALTER TABLE transactions ADD COLUMN reference_transaction_id INTEGER`);
-  } catch (err) {
-    // ignore if column already exists
-  }
-  try {
-    db.exec(`ALTER TABLE transactions ADD COLUMN cashier_id INTEGER`);
-  } catch (err) {
-    // ignore if column already exists
-  }
-
-  seedIfEmpty();
-}
-
-function seedIfEmpty() {
-  const row = db.prepare('SELECT COUNT(*) as count FROM stores').get();
-  if (row.count > 0) {
+async function seedIfEmpty() {
+  const storeCount = await Store.countDocuments().exec();
+  if (storeCount > 0) {
     return;
   }
 
-  const insertStore = db.prepare(
-    'INSERT INTO stores (code, name, address, phone) VALUES (?, ?, ?, ?)'
-  );
-  const storeInfo = insertStore.run(
-    '001',
-    'Demo Superstore',
-    '123 Main St, Demo City',
-    '555-123-4567'
-  );
-  const storeId = storeInfo.lastInsertRowid;
+  const store = await Store.create({
+    code: '001',
+    name: 'Demo Superstore',
+    address: '123 Main St, Demo City',
+    phone: '555-123-4567'
+  });
 
-  const insertRegister = db.prepare(
-    'INSERT INTO registers (store_id, code, name) VALUES (?, ?, ?)'
-  );
-  insertRegister.run(storeId, 'R1', 'Front Register 1');
+  const register = await Register.create({
+    store: store._id,
+    code: 'R1',
+    name: 'Front Register 1'
+  });
 
-  const insertProduct = db.prepare(
-    'INSERT INTO products (sku, barcode, name, category, price, tax_rate, active) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  );
-
-  const products = [
+  const productsSeed = [
     {
       sku: '1001',
       barcode: '100000000001',
@@ -177,63 +141,79 @@ function seedIfEmpty() {
     }
   ];
 
-  const insertInventory = db.prepare(
-    'INSERT INTO inventory (store_id, product_id, quantity) VALUES (?, ?, ?)'
-  );
-
-  for (const p of products) {
-    const info = insertProduct.run(
-      p.sku,
-      p.barcode,
-      p.name,
-      p.category,
-      p.price,
-      p.tax_rate,
-      1
-    );
-    const productId = info.lastInsertRowid;
-    insertInventory.run(storeId, productId, 100);
+  const products = [];
+  for (const p of productsSeed) {
+    const prod = await Product.create({
+      sku: p.sku,
+      barcode: p.barcode,
+      name: p.name,
+      category: p.category,
+      price: p.price,
+      tax_rate: p.tax_rate,
+      active: true
+    });
+    products.push(prod);
+    await Inventory.create({
+      store: store._id,
+      product: prod._id,
+      quantity: 100
+    });
   }
 
-  const insertTemplate = db.prepare(
-    'INSERT INTO receipt_templates (store_id, header, footer, options) VALUES (?, ?, ?, ?)'
-  );
-
-  const headerTemplate = `{{store_name}}
-{{store_address}}
-{{store_phone}}
-
-`;
-  const footerTemplate = `Thank you for shopping with us!
-TC#: {{tc_number}}
-Date: {{date}}
-Cashier: {{cashier_name}}
-Type: {{tx_type}}
-`;
-
-  const options = JSON.stringify({
-    show_tax_breakdown: true
+  await ReceiptTemplate.create({
+    store: store._id,
+    header: '{{store_name}}\n{{store_address}}\n{{store_phone}}\n\n',
+    footer:
+      'Thank you for shopping with us!\nTC#: {{tc_number}}\nDate: {{date}}\nCashier: {{cashier_name}}\nType: {{tx_type}}\n',
+    options: {
+      show_tax_breakdown: true
+    }
   });
-
-  insertTemplate.run(storeId, headerTemplate, footerTemplate, options);
-
-  const insertUser = db.prepare(
-    'INSERT INTO users (username, password_hash, role, store_id) VALUES (?, ?, ?, ?)'
-  );
 
   const adminPassword = bcrypt.hashSync('admin123', 10);
   const managerPassword = bcrypt.hashSync('manager123', 10);
   const cashierPassword = bcrypt.hashSync('cashier123', 10);
 
-  // Global admin (no specific store)
-  insertUser.run('admin', adminPassword, 'admin', null);
+  await User.create({
+    username: 'admin',
+    password_hash: adminPassword,
+    role: 'admin',
+    store: null
+  });
 
-  // Store-level manager and cashier
-  insertUser.run('manager', managerPassword, 'manager', storeId);
-  insertUser.run('cashier', cashierPassword, 'cashier', storeId);
+  await User.create({
+    username: 'manager',
+    password_hash: managerPassword,
+    role: 'manager',
+    store: store._id
+  });
+
+  await User.create({
+    username: 'cashier',
+    password_hash: cashierPassword,
+    role: 'cashier',
+    store: store._id
+  });
+
+  // keep lints quiet about unused register variable
+  void register;
+}
+
+async function initDb() {
+  await mongoose.connect(MONGODB_URI, {
+    maxPoolSize: 10
+  });
+  await seedIfEmpty();
 }
 
 module.exports = {
-  db,
-  initDb
+  initDb,
+  Store,
+  Register,
+  Product,
+  Inventory,
+  ReceiptTemplate,
+  User,
+  Transaction,
+  TransactionItem
 };

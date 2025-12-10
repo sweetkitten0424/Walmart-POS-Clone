@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const { db } = require('./db');
+const { User } = require('./db');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key-change-me';
 const TOKEN_EXPIRY = '12h';
@@ -8,26 +8,24 @@ const TOKEN_EXPIRY = '12h';
 function createToken(user) {
   return jwt.sign(
     {
-      id: user.id,
+      id: String(user._id),
       username: user.username,
       role: user.role,
-      storeId: user.store_id || null
+      storeId: user.store ? String(user.store) : null
     },
     JWT_SECRET,
     { expiresIn: TOKEN_EXPIRY }
   );
 }
 
-function handleLogin(req, res) {
+async function handleLogin(req, res) {
   const { username, password } = req.body || {};
 
   if (!username || !password) {
     return res.status(400).json({ error: 'username and password are required' });
   }
 
-  const user = db
-    .prepare('SELECT * FROM users WHERE username = ?')
-    .get(username);
+  const user = await User.findOne({ username }).lean();
 
   if (!user) {
     return res.status(401).json({ error: 'Invalid credentials' });
@@ -43,10 +41,10 @@ function handleLogin(req, res) {
   return res.json({
     token,
     user: {
-      id: user.id,
+      id: String(user._id),
       username: user.username,
       role: user.role,
-      storeId: user.store_id
+      storeId: user.store ? String(user.store) : null
     }
   });
 }

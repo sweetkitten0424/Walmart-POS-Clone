@@ -1,4 +1,10 @@
-const { db } = require('./db');
+const {
+  Transaction,
+  TransactionItem,
+  ReceiptTemplate,
+  Store,
+  Register
+} = require('./db');
 
 function applyTemplate(text, context) {
   if (!text) {
@@ -22,77 +28,45 @@ function formatMoney(value) {
  * Render a text receipt for the given transaction.
  * Uses the store's receipt template (header/footer) plus a fixed body layout.
  */
-function renderTextReceipt(transactionId) {
-  const tx = db
-    .prepare(
-      `
-      SELECT
-        t.*,
-        s.name AS store_name,
-        s.address AS store_address,
-        s.phone AS store_phone,
-        s.code AS store_code,
-        r.code AS register_code,
-        r.name AS register_name
-      FROM transactions t
-      JOIN stores s ON s.id = t.store_id
-      JOIN registers r ON r.id = t.register_id
-      WHERE t.id = ?
-    `
-    )
-    .get(transactionId);
+async function renderTextReceipt(transactionId) {
+  const tx = await Transaction.findById(transactionId)
+    .populate('store')
+    .populate('register')
+    .lean();
 
   if (!tx) {
     throw new Error('Transaction not found');
   }
 
-  const items = db
-    .prepare(
-      `
-      SELECT
-        ti.*,
-        p.name AS product_name
-      FROM transaction_items ti
-      JOIN products p ON p.id = ti.product_id
-      WHERE ti.transaction_id = ?
-    `
-    )
-    .all(transactionId);
+  const items = await TransactionItem.find({ transaction: tx._id }).lean();
 
-  let template = db
-    .prepare('SELECT * FROM receipt_templates WHERE store_id = ?')
-    .get(tx.store_id);
+  let template = await ReceiptTemplate.findOne({ store: tx.store._id }).lean();
 
   if (!template) {
     template = {
       header: '{{store_name}}\n{{store_address}}\n{{store_phone}}\n',
       footer: 'Thank you for shopping!\nTC#: {{tc_number}}\n',
-      options: JSON.stringify({ show_tax_breakdown: true })
+      options: { show_tax_breakdown: true }
     };
   }
 
-  let options = {};
-  if (template.options) {
-    try {
-      options = JSON.parse(template.options);
-    } catch (err) {
-      options = {};
-    }
-  }
+  const options = template.options || {};
 
-  const createdAt = new Date(tx.created_at);
+  const createdAt =
+    tx.created_at instanceof Date ? tx.created_at : new Date(tx.created_at);
+
   const context = {
-    store_name: tx.store_name,
-    store_address: tx.store_address || '',
-    store_phone: tx.store_phone || '',
+    store_name: tx.store.name,
+    store_address: tx.store.address || '',
+    store_phone: tx.store.phone || '',
     tc_number: tx.tc_number,
     total: formatMoney(tx.total),
     subtotal: formatMoney(tx.subtotal),
     tax_total: formatMoney(tx.tax_total),
     date: createdAt.toLocaleString(),
     cashier_name: tx.cashier_name || '',
-    store_code: tx.store_code,
-    register_code: tx.register_code,
+    store_code: tx.store.code,
+    register_code: tx.register.code,
     tx_type: tx.type || 'SALE',
     payment_method: tx.payment_method
   };
@@ -113,16 +87,16 @@ function renderTextReceipt(transactionId) {
   if (tx.cashier_name) {
     lines.push(`Cashier: ${tx.cashier_name}`);
   }
-  lines.push(`Store: ${tx.store_name} (${tx.store_code})`);
-  lines.push(`Register: ${tx.register_code}`);
+  lines.push(`Store: ${tx.store.name} (${tx.store.code})`);
+  lines.push(`Register: ${tx.register.code}`);
   lines.push(`Payment: ${tx.payment_method}`);
   lines.push('');
   lines.push('Items:');
 
   items.forEach((item) => {
-    const name = item.product_name;
+    const name = item.product_name || '';
     const qty = Math.abs(item.quantity);
-    const price = item.unit_price.toFixed(2);
+    const price = (item.unit_price || 0).toFixed(2);
     const lineTotal = formatMoney(item.line_total);
     lines.push(`- ${name} x${qty} @ ${price} = ${lineTotal}`);
   });
